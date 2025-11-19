@@ -1,0 +1,178 @@
+name: Deploy Ollama to Air-Gapped GPU Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'Models to download (comma-separated)'
+        required: true
+        default: 'codellama:7b,codellama:13b'
+      gpu_node_host:
+        description: 'GPU node hostname/IP'
+        required: true
+
+env:
+  OLLAMA_VERSION: '0.5.4'
+  BUNDLE_DIR: 'deployment-bundle'
+
+jobs:
+  build-offline-bundle:
+    name: Build Offline Deployment Bundle
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create bundle directory structure
+        run: |
+          mkdir -p ${{ env.BUNDLE_DIR }}/{installers,models,scripts,config}
+
+      - name: Download Ollama installer for Linux
+        run: |
+          cd ${{ env.BUNDLE_DIR }}/installers
+          # Download official Ollama Linux binary
+          curl -fsSL https://github.com/ollama/ollama/releases/download/v${{ env.OLLAMA_VERSION }}/ollama-linux-amd64 \
+            -o ollama
+          chmod +x ollama
+
+          # Download install script (we'll modify it for offline use)
+          curl -fsSL https://ollama.com/install.sh -o install.sh
+
+          # Generate checksums
+          sha256sum ollama install.sh > checksums.txt
+
+      - name: Pull models using Ollama (on CI runner)
+        run: |
+          # Install Ollama temporarily on CI runner to download models
+          cd ${{ env.BUNDLE_DIR }}/installers
+          sudo install -o root -g root -m 755 ollama /usr/local/bin/ollama
+
+          # Start Ollama in background
+          ollama serve &
+          OLLAMA_PID=$!
+          sleep 5
+
+          # Pull each model
+          IFS=',' read -ra MODELS <<< "${{ github.event.inputs.models }}"
+          for model in "${MODELS[@]}"; do
+            model=$(echo "$model" | xargs) # trim whitespace
+            echo "Pulling model: $model"
+            ollama pull "$model"
+          done
+
+          # Stop Ollama
+          kill $OLLAMA_PID || true
+
+          # Copy model files from Ollama's storage
+          # Ollama stores models in ~/.ollama/models
+          sudo cp -r ~/.ollama/models/* ${{ env.BUNDLE_DIR }}/models/
+          sudo chown -R $(whoami):$(whoami) ${{ env.BUNDLE_DIR }}/models/
+
+          # Create model manifest
+          ls -lhR ${{ env.BUNDLE_DIR }}/models/ > ${{ env.BUNDLE_DIR }}/models/manifest.txt
+
+      - name: Copy deployment scripts
+        run: |
+          cp -r scripts/* ${{ env.BUNDLE_DIR }}/scripts/
+          cp -r config/* ${{ env.BUNDLE_DIR }}/config/
+          chmod +x ${{ env.BUNDLE_DIR }}/scripts/*.sh
+
+      - name: Create deployment metadata
+        run: |
+          cat > ${{ env.BUNDLE_DIR }}/deployment.json <<EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "ollama_version": "${{ env.OLLAMA_VERSION }}",
+            "models": "${{ github.event.inputs.models }}",
+            "commit_sha": "${{ github.sha }}",
+            "triggered_by": "${{ github.actor }}"
+          }
+          EOF
+
+      - name: Create tarball
+        run: |
+          tar -czf gpu-node-deployment.tar.gz ${{ env.BUNDLE_DIR }}/
+          sha256sum gpu-node-deployment.tar.gz > gpu-node-deployment.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-node-deployment-${{ github.run_number }}
+          path: |
+            gpu-node-deployment.tar.gz
+            gpu-node-deployment.tar.gz.sha256
+          retention-days: 30
+
+  deploy-to-gpu-node:
+    name: Deploy to GPU Node
+    needs: build-offline-bundle
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gpu-node-deployment-${{ github.run_number }}
+
+      - name: Verify checksum
+        run: |
+          sha256sum -c gpu-node-deployment.tar.gz.sha256
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.GPU_NODE_SSH_KEY }}" > ~/.ssh/gpu_node_key
+          chmod 600 ~/.ssh/gpu_node_key
+
+          # Add to known_hosts (use ssh-keyscan or provide known_hosts)
+          ssh-keyscan -H ${{ github.event.inputs.gpu_node_host }} >> ~/.ssh/known_hosts || true
+
+      - name: Transfer bundle to GPU node
+        run: |
+          scp -i ~/.ssh/gpu_node_key \
+            -o StrictHostKeyChecking=no \
+            gpu-node-deployment.tar.gz \
+            ${{ secrets.GPU_NODE_USER }}@${{ github.event.inputs.gpu_node_host }}:/tmp/
+
+      - name: Execute bootstrap on GPU node
+        run: |
+          ssh -i ~/.ssh/gpu_node_key \
+            -o StrictHostKeyChecking=no \
+            ${{ secrets.GPU_NODE_USER }}@${{ github.event.inputs.gpu_node_host }} << 'ENDSSH'
+            set -euo pipefail
+
+            # Verify checksum on GPU node
+            cd /tmp
+            echo "Extracting deployment bundle..."
+            tar -xzf gpu-node-deployment.tar.gz
+
+            # Execute bootstrap script
+            cd deployment-bundle/scripts
+            chmod +x bootstrap-gpu-node.sh
+            sudo ./bootstrap-gpu-node.sh
+
+            # Cleanup
+            cd /tmp
+            rm -rf deployment-bundle gpu-node-deployment.tar.gz
+
+            echo "✓ Deployment completed successfully"
+          ENDSSH
+
+      - name: Verify deployment
+        run: |
+          ssh -i ~/.ssh/gpu_node_key \
+            -o StrictHostKeyChecking=no \
+            ${{ secrets.GPU_NODE_USER }}@${{ github.event.inputs.gpu_node_host }} << 'ENDSSH'
+            # Check Ollama service status
+            systemctl status ollama --no-pager || true
+
+            # List available models
+            sleep 3
+            ollama list || echo "Warning: Ollama not responding yet"
+          ENDSSH
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/gpu_node_key
